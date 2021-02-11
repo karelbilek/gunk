@@ -1,6 +1,4 @@
-[generate]
-command=protoc-gen-go
+[generate go]
 plugins=grpc
 
-[generate]
-command=protoc-gen-grpc-gateway
+[generate grpc-gateway]

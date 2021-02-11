@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"go/types"
 	"io/ioutil"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -20,11 +21,23 @@ import (
 	"google.golang.org/genproto/googleapis/api/annotations"
 
 	"github.com/gunk/gunk/config"
+	"github.com/gunk/gunk/generate/downloader"
 	"github.com/gunk/gunk/loader"
 	"github.com/gunk/gunk/log"
 	"github.com/gunk/gunk/protoutil"
 	"github.com/gunk/gunk/reflectutil"
 )
+
+var protoDownloader = downloader.Protoc{}
+
+type Downloader interface {
+	Download(version string) (string, error)
+}
+
+var downloaders = map[string]Downloader{
+	"go":        downloader.Go{},
+	"grpc-java": downloader.GrpcJava{},
+}
 
 // Run generates the specified Gunk packages via protobuf generators, writing
 // the output files in the same directories.
@@ -80,7 +93,7 @@ func Run(dir string, args ...string) error {
 	// Finally, run the code generators.
 	for _, pkg := range pkgs {
 		cfg := pkgConfigs[pkg.Dir]
-		protocPath, err := CheckOrDownloadProtoc(cfg.ProtocPath, cfg.ProtocVersion)
+		protocPath, err := protoDownloader.CheckOrDownload(cfg.ProtocPath, cfg.ProtocVersion)
 		if err != nil {
 			return fmt.Errorf("unable to check or download protoc: %w", err)
 		}
@@ -167,11 +180,24 @@ type Generator struct {
 
 func (g *Generator) recordPkgs(pkgs ...*loader.GunkPackage) {
 	for _, pkg := range pkgs {
+		fmt.Println("uhhh", pkg.Name, pkg.Dir, pkg.ProtoName, pkg.PkgPath)
 		g.gunkPkgs[pkg.PkgPath] = pkg
 		for _, ipkg := range pkg.Imports {
 			g.recordPkgs(ipkg)
 		}
 	}
+}
+
+type configWithBinary struct {
+	config.Generator
+	binary *string
+}
+
+func (c configWithBinary) actualCommand() string {
+	if c.binary == nil {
+		return c.Command
+	}
+	return *c.binary
 }
 
 // GeneratePkg runs the proto files resulting from translating gunk packages
@@ -185,31 +211,32 @@ func (g *Generator) recordPkgs(pkgs ...*loader.GunkPackage) {
 // the generators should already handle the case where they have nothing to do.
 func (g *Generator) GeneratePkg(path string, gens []config.Generator, protocPath string) error {
 	req := g.requestForPkg(path)
-	// first, check whether we need to use plugin for pinned protoc-gen-go versions
-	// and download those
-	for i, gen := range gens {
+
+	for _, gen := range gens {
+		c := configWithBinary{Generator: gen}
 		if gen.PluginVersion != "" {
-			if !gen.IsGo() {
-				return fmt.Errorf("cannot use plugin_version with other plugins than go")
+			// first, check whether we need to use pinned plugin versions
+			dl, ok := downloaders[gen.Code()]
+			if !ok {
+				return fmt.Errorf("plugin %s does not support pinned versions", gen.Code())
 			}
 
-			bin, err := BuildProtocGenGo(gen.PluginVersion)
+			bin, err := dl.Download(gen.PluginVersion)
 			if err != nil {
 				return err
 			}
 
-			gens[i].ProtocGen = ""
-			gens[i].Command = bin
+			fmt.Println("Downloaded -", bin)
+			c.binary = &bin
 		}
-	}
-	// Run any other configured generators.
-	for _, gen := range gens {
+
 		if gen.IsProtoc() {
-			if err := g.generateProtoc(*req, gen, protocPath); err != nil {
+			if err := g.generateProtoc(*req, c, protocPath); err != nil {
 				return fmt.Errorf("unable to generate protoc: %w", err)
 			}
 		} else {
-			if err := g.generatePlugin(*req, gen); err != nil {
+			fmt.Println("ONE PLUGIN")
+			if err := g.generatePlugin(*req, c); err != nil {
 				return fmt.Errorf("unable to generate plugin: %w", err)
 			}
 		}
@@ -217,7 +244,7 @@ func (g *Generator) GeneratePkg(path string, gens []config.Generator, protocPath
 	return nil
 }
 
-func (g *Generator) generateProtoc(req plugin.CodeGeneratorRequest, gen config.Generator, protocCommandPath string) error {
+func (g *Generator) generateProtoc(req plugin.CodeGeneratorRequest, gen configWithBinary, protocCommandPath string) error {
 	fds := &desc.FileDescriptorSet{}
 	// Make a copy of the slice, as we may modify the elements within. See
 	// the pf2 copying below.
@@ -230,6 +257,9 @@ func (g *Generator) generateProtoc(req plugin.CodeGeneratorRequest, gen config.G
 
 	// Default location to output protoc generated files.
 	protocOutputPath := ""
+
+	// req.GetFileToGenerate() is always just 1 field, as we create the request
+	// and it has just the one proto file
 	for _, ftg := range req.GetFileToGenerate() {
 		pkgPath, basename := filepath.Split(ftg)
 		protoFilenames = append(protoFilenames, basename)
@@ -257,6 +287,8 @@ func (g *Generator) generateProtoc(req plugin.CodeGeneratorRequest, gen config.G
 			return fmt.Errorf("failed to get package %s to protoc generate", pkgPath)
 		}
 		protocOutputPath = gpkg.Dir
+		fmt.Println("output path")
+		fmt.Println(protocOutputPath)
 	}
 
 	bs, err := protoutil.MarshalDeterministic(fds)
@@ -264,13 +296,28 @@ func (g *Generator) generateProtoc(req plugin.CodeGeneratorRequest, gen config.G
 		return fmt.Errorf("cannot marshal deterministically: %w", err)
 	}
 
+	protocGen := gen.ProtocGen
+	// we know gen.ProtocGen is not empty
+	if gen.ProtocGen == "" {
+		protocGen = "custom"
+	}
+
 	// Build up the protoc command line arguments.
 	args := []string{
-		fmt.Sprintf("--%s_out=%s", gen.ProtocGen, gen.ParamStringWithOut(protocOutputPath)),
+		fmt.Sprintf("--%s_out=%s", protocGen, gen.ParamStringWithOut(protocOutputPath)),
 		"--descriptor_set_in=/dev/stdin",
 	}
 
+	if gen.actualCommand() != "" {
+		cmdWholePath, err := exec.LookPath(gen.actualCommand())
+		if err != nil {
+			return fmt.Errorf("cannot find path to %q", cmdWholePath)
+		}
+		args = append(args, fmt.Sprintf("--plugin=protoc-gen-%s=%s", protocGen, cmdWholePath))
+	}
+
 	args = append(args, protoFilenames...)
+	fmt.Printf("arg: %+v\n", args)
 
 	cmd := log.ExecCommand(protocCommandPath, args...)
 	cmd.Stdin = bytes.NewReader(bs)
@@ -286,7 +333,11 @@ func (g *Generator) generateProtoc(req plugin.CodeGeneratorRequest, gen config.G
 	return nil
 }
 
-func (g *Generator) generatePlugin(req plugin.CodeGeneratorRequest, gen config.Generator) error {
+func (g *Generator) generatePlugin(req plugin.CodeGeneratorRequest, gen configWithBinary) error {
+	//base := filepath.Join(filepath.Dir(source.GetName()))
+	for _, source := range req.ProtoFile {
+		fmt.Println("SOURCE FNAME", *source.Name)
+	}
 	// Due to problems with some generators (grpc-gateway),
 	// we need to ensure we either send a non-empty string or nil.
 	if ps := gen.ParamString(); ps != "" {
@@ -296,11 +347,11 @@ func (g *Generator) generatePlugin(req plugin.CodeGeneratorRequest, gen config.G
 	if err != nil {
 		return fmt.Errorf("cannot marshal deterministically: %w", err)
 	}
-	cmd := log.ExecCommand(gen.Command)
+	cmd := log.ExecCommand(gen.actualCommand())
 	cmd.Stdin = bytes.NewReader(bs)
 	out, err := cmd.Output()
 	if err != nil {
-		return log.ExecError(gen.Command, err)
+		return log.ExecError(gen.actualCommand(), err)
 	}
 	var resp plugin.CodeGeneratorResponse
 	if err := proto.Unmarshal(out, &resp); err != nil {
@@ -310,16 +361,33 @@ func (g *Generator) generatePlugin(req plugin.CodeGeneratorRequest, gen config.G
 		return fmt.Errorf("error from generator %s: %s", gen.Command, rerr)
 	}
 	for _, rf := range resp.File {
+		// some code generators (go) return path with the full package path,
+		// some
+
 		// Turn the relative package file path to the absolute
 		// on-disk file path.
 		pkgPath, basename := filepath.Split(*rf.Name)
 		pkgPath = filepath.Clean(pkgPath) // to remove trailing slashes
 		gpkg, ok := g.gunkPkgs[pkgPath]
+
+		var existingPackages []string
+		for path := range g.gunkPkgs {
+			existingPackages = append(existingPackages, path)
+		}
+
+		fmt.Printf("tuto rf.name=%q pkgPath=%q in %+v\n", *rf.Name, pkgPath, existingPackages)
 		if !ok {
-			return fmt.Errorf("failed to get gunk package %s from code generator response", pkgPath)
+			// some code generators (java)
+
+			var existingPackages []string
+			for path := range g.gunkPkgs {
+				existingPackages = append(existingPackages, path)
+			}
+
+			return fmt.Errorf("failed to get gunk package %q from code generator response; existing packages: %+v", pkgPath, existingPackages)
 		}
 		data := []byte(*rf.Content)
-		if data, err = postProcess(data, gen); err != nil {
+		if data, err = postProcess(data, gen.Generator); err != nil {
 			return fmt.Errorf("failed to execute post processing: %s", err.Error())
 		}
 		dir := gen.OutPath(gpkg.Dir)
@@ -332,6 +400,7 @@ func (g *Generator) generatePlugin(req plugin.CodeGeneratorRequest, gen config.G
 }
 
 func (g *Generator) requestForPkg(pkgPath string) *plugin.CodeGeneratorRequest {
+	fmt.Println("request for pkg:", pkgPath)
 	req := &plugin.CodeGeneratorRequest{}
 	req.FileToGenerate = append(req.FileToGenerate, unifiedProtoFile(pkgPath))
 	for _, pfile := range g.allProto {

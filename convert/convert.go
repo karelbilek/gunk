@@ -3,6 +3,7 @@ package convert
 import (
 	"bytes"
 	"fmt"
+	"github.com/gunk/gunk/generate/downloader"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -10,7 +11,6 @@ import (
 
 	"github.com/gunk/gunk/config"
 	"github.com/gunk/gunk/format"
-	"github.com/gunk/gunk/generate"
 	"github.com/gunk/gunk/loader"
 )
 
@@ -41,7 +41,8 @@ func run(path string, overwrite bool) error {
 		cfgProtocVer = cfg.ProtocVersion
 	}
 
-	protocPath, err := generate.CheckOrDownloadProtoc(cfgProtocPath, cfgProtocVer)
+	dl := downloader.Protoc{}
+	protocPath, err := dl.CheckOrDownload(cfgProtocPath, cfgProtocVer)
 	if err != nil {
 		return err
 	}

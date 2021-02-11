@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/gunk/gunk/generate/downloader"
 	"os"
 
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
@@ -122,6 +123,7 @@ func main2() (code int) {
 }
 
 func downloadProtoc() error {
-	_, err := generate.CheckOrDownloadProtoc(*dlProtocPath, *dlProtocVer)
+	dl := downloader.Protoc{}
+	_, err := dl.CheckOrDownload(*dlProtocPath, *dlProtocVer)
 	return err
 }

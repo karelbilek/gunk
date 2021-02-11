@@ -38,8 +38,15 @@ func (g Generator) IsProtoc() bool {
 	return g.ProtocGen != ""
 }
 
+func (g Generator) Code() string {
+	if g.ProtocGen != "" {
+		return g.ProtocGen
+	}
+	return strings.TrimPrefix(g.Command, "protoc-gen-")
+}
+
 func (g Generator) IsGo() bool {
-	return g.ProtocGen == "go" || strings.Contains(g.Command, "protoc-gen-go")
+	return g.Code() == "go"
 }
 
 func (g Generator) ParamString() string {

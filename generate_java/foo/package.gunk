@@ -1,0 +1,34 @@
+// +gunk java.Package("testdata.tld/util/foo")
+// +gunk java.MultipleFiles(true)
+
+package foo
+
+import (
+  "github.com/gunk/opt/file/java"
+  "github.com/gunk/opt/http"
+  "github.com/gunk/opt/openapiv2"
+)
+
+type Foo struct {
+	// Bar is a string
+	Bar string `pb:"1" json:"bar"`
+}
+
+// FooService provides foo operations.
+type FooService interface {
+	// GetFoo gets foo
+	//
+	// +gunk http.Match{
+	//         Method: "GET",
+	//         Path:   "/v1/foo",
+	// }
+	// +gunk openapiv2.Operation{
+	//         Tags:        []string{"Foo"},
+	//         Summary: "Gets foo",
+	//         Responses: map[string]openapiv2.Response{
+	//                 "200": openapiv2.Response{
+	//                 },
+	//         },
+	// }
+	GetFoo() Foo
+}
